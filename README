@@ -1,0 +1,76 @@
+Intro: 
+Hi and thanks for checking this out, I hope it is useful.
+I recognize this script is generally a dumpster-fire and there are better and more efficient tools out there, but it kinda works and if anyone's interested in helping inprove it or whatever cool and thanks.
+
+Key Points: 
+
+0. So, as of now there are two files
+0a. "spot_check" the main file to be invoked from the CLI
+0b. "cred" a file that is sourced from "spot_check", this file has credential infomation.
+
+0c. Some known TODOs:
+	* Refactor code into something that is modular, intuitive, consistent, and more efficient.
+	* modularize auth handling: 
+	* check for anonymous bind
+	* Provide kerb auth (if possible)
+	* Provide WMI in case SNMP not present
+	* Fix help because its about as outdated as this script 
+
+1. Some ways, I've found this script to be useful
+
+1a. Need to check something really quick in AD or a Server (its original purpose), hence the name.
+1b. Check system logs for login attempts from non-existent or disable accounts
+1c. Auditing AD group membership changes
+1d. Auditing Host Local-Group Memberships
+1e. Quick dump of installed applications on devices
+1f. Quick dump of running applications great for preparing nagios checks (or if your RAT is running or hidden from the process table :) ) 
+1g. Quick dump of shares on a host
+1h. General AD cleanup processes
+1i. Generating a report after conducting password audit. Will upload the password auditing script (once its been modified for human consumption). :)
+
+Sample Usage:
+Sample 0 # List Members of "Domain Admins"
+
+----begin snippet 0----
+DC="hostname-of-domain-controller";
+spot_check ad "$DC" member "Domain Admins";
+----end snippet 0----
+
+
+Sample 1 # Simple Audit of A/D Group Membership Change
+
+----begin snippet 1----
+f_check_ad_grp()
+{
+# Function takes 2 parameters, $1=Domain Controller, $2=optional regex to refresh / make new reference set
+DC="$1";
+
+if [[ $2 =~ refresh|new|clean ]]; then
+ echo "Making new reference copy of group memberships!!!";
+ spot_check ad "$DC" group alladgrpmbms >"/tmp/grp_${DC}_ref";
+fi
+ spot_check ad "$DC" group alladgrpmbms >"/tmp/grp_${DC}_cur";
+
+ ad_group_change=$(diff "/tmp/grp_${DC}_ref" "/tmp/grp_${DC}_cur")
+echo "$ad_group_change";
+}
+
+# Using this function
+# Make ref AD group membership
+# call function as such:  f_check_ad_grp dc refresh
+# Make change to AD group membership
+# blah blah blah "Active Directory Users and Computers or PowerShell" blah blah blah
+# See change you made.
+# Call function as:  such f_check_ad_grp dc
+
+----end snippet 1----
+Sample 2 # Local Administrators etc group
+----begin snippet 2----
+
+DC="hostname-of-domain-controller";
+known_good_loc_adms_regex="Workstation_Admins|Administrator";
+
+admin_mbms=$(for computer in $(spot_check ad "$DC" computer all|sed -r 's/(^(\s)?$|\$)//'); do ping -c1 -W1 "$computer" 2>/tmp/admins_ping_errors.txt  >/dev/null && spot_check adminmbms_parse "${computer}" 2>/tmp/admins_errors.txt|grep -Evi "$known_good_loc_adms_regex"|sed '/^$/d'; done);
+
+echo "$admin_mbms";
+---- end snippet 2----

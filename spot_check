@@ -1,0 +1,386 @@
+#!/bin/bash
+host=$2;
+thing=$1;
+
+# The souced file has snmp(w/some logic), net, and cifs/smb-auth-file defs
+#
+## You shouldn't unnecessary leave cred files lying about the place :)
+## If you keep this file locally, remember to keep the unencrypted version somewhere like either a ramfs or dm-crypt/luks filesystem.
+source ./cred
+
+case "$thing" in
+
+	 # Grab things that are running via SNMP
+    running|running_ws|running_other)
+        snmpwalk -v 2c -c "$comm_string" "$host" .1.3.6.1.2.1.25.4.2.1.2|awk -F\" '{proc=$2; print proc}'|sort;
+    ;;
+
+	 # Gtab things that show up in "Add/Remove Programs" via SNMP
+    installed|installed_ws|installed_other)
+        snmpwalk -v 2c -c "$comm_string" "$host" .1.3.6.1.2.1.25.6.3.1.2|awk -F\" '{print $2}'|sort;
+    ;;
+
+	 # Gtab storage info via SNMP
+    storage|storage_ws|storage_other)
+        snmpwalk -v 2c -c "$comm_string" "$host" .1.3.6.1.2.1.25.2.3.1.3|awk -F\= '{print $NF}'; 
+    ;;
+
+	 # Get list of local shares
+    shares)
+		  #Remove the|grep "blah blah blah", if you want to see admin shares
+        echo "************** $host **************"; smbclient -kg -A "$cifscreds_file" -L "${host}" 2>/dev/null|sort|grep -Ev '(ADMIN|IPC|[A-Z])\$'; 
+    ;;
+
+	 # Get List of local groups
+    groups)
+        net rpc group -S "$host" -U "$net_user%$net_pass"
+    ;;
+
+	 # Check members of local groups
+    members)
+        local_grp="${3}";
+        echo "$host :: ${local_grp}"; 
+        net rpc group members  "${local_grp}" -S "$host" -U "$net_user%$net_pass";
+    ;;
+
+	 # Human Friendly report of groups and their members
+    agrpmbms)
+        net rpc group -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|sort -d|while read lgroup;
+        do echo  "$host :: $lgroup"; net rpc group members "${lgroup}" -S "$host" -U "$net_user%$net_pass"; echo -e "\n"; done
+    ;;
+
+	 # Parsable list of groups and their members
+    agrpmbms_parse)
+        net rpc group -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|sort -d|while read lgroup;
+        do net rpc group members "${lgroup}" -S "$host" -U "$net_user%$net_pass"|awk -v hst="$host" -v lg="$lgroup" '{print hst"|"lg"|"$0}'; done|sort -t: -k1,1 -k2,2 -k3,3
+    ;;
+
+	 # Parsable list of Groups and their members if group matches regex of Interest (often for elevated priv checks)
+    adminmbms_parse)
+        net rpc group -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|egrep --color=never "$admin_grp_regex" |sort -d|while read lgroup;
+        do net rpc group members "${lgroup}" -S "$host" -U "$net_user%$net_pass" -t 5 |awk -v hst="$host" -v lg="$lgroup" '{print hst" : "lg" : "$0}'; done
+    ;;
+
+    lsof)
+        net rpc file -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|grep -Evi 'FileId|Enumerating open|\\PIPE\\spoolss|^$|\-'|sort -k2 -k5h
+    ;;
+
+    ad|ldap)
+        object_to_get="$3";
+        object_state="$4";
+
+        case "$object_state" in
+			   # Return SamAccountName and UAC of disabled objects
+            disabled)
+                if [ "$object_to_get" == "user" ] || [ "$object_to_get" == "computer" ]; then
+                net ads search "(&(objectCategory=$object_to_get)(userAccountControl:1.2.840.113556.1.4.803:=2))" samaccountname useraccountcontrol -e -w "$domain" -S "$host" -U "$net_user%$net_pass" |awk '{print $2,$1}'|sed -re 's/(userAccountControl|sAMAccountName):/,/g'|sed ':a;N;$!ba;s/,\n//g'|awk '{print $2,$1}'|sort|grep -Ev '^Got|^(\s)?$' 
+
+                else 
+                    echo "$object_to_get is invalid for use here. Only 'computer' or 'user' is allowed"; exit 1;
+                fi
+            ;;
+
+				# Return SamAccountName and UAC of enabled objects
+            enabled)
+                if [ "$object_to_get" == "user" ]; then
+                    net ads search "(&(objectCategory=$object_to_get)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))" samaccountname useraccountcontrol -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|awk '{print $2,$1}'|sed -re 's/(userAccountControl|sAMAccountName):/,/g'|sed ':a;N;$!ba;s/,\n//g'|awk '{print $2,$1}'|sort|grep -Ev '^Got|^(\s)?$' 
+                elif [ "$object_to_get" == "computer" ]; then
+                    echo "Funtion not yet implemented!"; exit 1;
+
+                else 
+                    echo "$object_to_get is invalid for use here. Only 'computer' or 'user' is allowed"; exit 1;
+                fi
+            ;;
+
+
+				# Return basic enable/disable status of users
+            status)
+                if [ "$object_to_get" == "user" ]; then
+						  username=$5
+						  enbstatus=$(net ads search "(&(objectCategory=$object_to_get)(sAMAccountName=$username)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))" useraccountcontrol -e -w "$domain" -S "$host" -U "$net_user%$net_pass" |grep -Ev '^Got|^(\s)?$') 
+						  if  [ -z "$enbstatus" ]; then retstat="Disabled"; else retstat="Enabled"; fi; echo "$retstat"; 
+                elif [ "$object_to_get" == "computer" ]; then
+                    echo "Funtion not yet implemented!"; exit 1;
+
+                else 
+                    echo "$object_to_get is invalid for use here. Only 'computer' or 'user' is allowed"; exit 1;
+                fi
+            ;;
+
+				# Grab users whose passwords are set not to expire
+            noexpire)
+                net ads search "(&(objectCategory=$object_to_get)(userAccountControl:1.2.840.113556.1.4.803:=65536))" samaccountname -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|grep -Ev ^Got|awk -F: '{print $2}'|sed '/^$/d'|sort
+            ;;
+            
+				# Get group members e.g "Domain Admins"
+            member)
+                groupname=$5;
+                net ads search "(&(objectclass=$object_to_get)(samaccountname=$groupname))" "$object_state" -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|grep -v ^Got|awk -F, '{print $1}'|awk -F= '{print $NF}'|sed '/^$/d'|sort
+            ;;
+
+
+				#Grab groups that object is a memberof and provide group-only view
+				memberof_grouponly)
+					 username=$5;
+                net ads search "(&(objectcategory=$object_to_get)(sAMAccountName=$username))" memberof -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|awk -F, 'gsub(/^memberOf: CN=/,"",$1) {print $1}'|sort -f
+				;;
+
+				# Grab groups that object is a memberof and provide Group and OU Info
+            memberof)
+                username=$5;
+                net ads search "(&(objectcategory=$object_to_get)(sAMAccountName=$username))" "$object_state" -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|awk -F: '{print $2}'|sed '/^$/d'|awk -F, '{print "Group_OU:"$2"\tGroup_Name: "$1}'|sed 's/\(CN=\|OU=\)//g';
+            ;;
+
+				# All groups and members
+				# TODO provide option for tree/recursion view, right now is one-deep.
+            alladgrpmbms)
+                net ads search "(&(objectcategory=group))" samaccountname member -S "$host" -U "$net_user%$net_pass"|tac|grep -Ev '^Got [0-9]* rep'|awk -F"," '{print $1}'|sed -re 's/^(sAMAccountName|member): (CN=)?//'|awk 'BEGIN {RS=""; FS="\n"; OFS="|"; ORS="\n"}; {$1=$1; print}'|less|sort -h|awk -F'|' 'BEGIN {OFS="|"}; { group=$1; $1=""; split($0, arr);  asort(arr); printf "%s ", group; for (i=2; i<=length(arr); i++) { printf "| %s ", arr[i] }; printf RS }'|sort;
+            ;;
+
+				# Get a list of when all objects of type have logged in.
+            alllastlogins)
+                gepoch2now () 
+                {
+						 #Isolate and remove leading white space
+                   entity=${1% *}; 
+                   entityn=${entity#* }; 
+                   entity=${entityn%% *}; 
+
+                   D=${1##* }; 
+						 if [[ ! ${D} =~ ^[0-9]+$ ]]; then D="nope"; fi
+						 #echo "$D";
+
+                if [ "$D" == "nope" ]; then
+                    echo "samAccountName=$1, lastlogin=$D";
+                else
+                     echo -n "$entity, ";  date +%F\ %H:%M:%S --date "$(date -d "01/01/1601 UTC $(let D=D/10000000; echo $D) seconds")";
+               fi
+ 
+                };
+
+               oIFS=${IFS}; IFS=$'\n'; for info in $(net ads search "(&(objectcategory=$object_to_get))" samaccountname lastlogontimestamp -S "$host" -U "$net_user%$net_pass"|egrep -v '^Got [0-9]* rep'|awk 'BEGIN {RS=""; FS="\n"; OFS=" "; ORS="\n"}; { $1=$1; gsub (/(sAMAccountName|lastLogonTimestamp):|\$/, "", $0); {print}}';); 
+					do 
+					gepoch2now "$info"; 
+					done; IFS=${oIFS} 
+            ;;
+
+				#When was object created
+            whencreated)
+                object_name=$5
+                if [ $object_to_get == "computer" ]; then
+                    object_name=$object_name"$";
+                fi
+                net ads search "(&(objectclass=$object_to_get)(SAMAccountname=$object_name))" "$object_state" -e -w "$domain" -S "$host" -U "$net_user%$net_pass" |grep -v ^Got|sed '/^$/d'|awk '{print substr ($2,1,4)"-"substr ($2,5,2)"-"substr($2,7,2)" "substr($2,9,2)":"substr($2,11,2)":"substr($2,13,2)" TZ="substr($2,16,2) }'
+            ;;
+
+				# Raw dump of AD info from user or computer account
+            getinfo)
+                object_name=$5;
+                if [ $object_to_get == "computer" ]; then
+                    object_name=$object_name"$";
+                fi
+
+                net ads search "(&(objectclass=$object_to_get)(samaccountname=$object_name))" -e -w "$domain" -S "$host" -U "$net_user%$net_pass"
+            ;;
+
+				# Get User's contactinfo
+            contactinfo)
+                object_name=$5;
+                if [ $object_to_get == "computer" ]; then
+                    echo "'Contactinfo' Attribute can only be queried for objects of type user."; exit 1;
+                fi
+
+					 net ads search "(&(objectclass=$object_to_get)(samaccountname=$object_name))" cn mail telephonenumber facsimileTelephoneNumber mobile department -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|grep -Ev '^Got|^(\s)*$'
+            ;;
+
+				# Get User's manager contactinfo
+            managerinfo)
+                object_name=$5;
+                if [ "$object_to_get" != "user" ]; then
+                    echo "Manager information can only be queried for objects of type user."; exit 1;
+                fi
+
+					 manager=$(net ads search "(&(objectclass=$object_to_get)(samaccountname=$object_name))" manager -e -w "$domain" -S "$host" -U "$net_user%$net_pass" 2>/dev/null|grep -Ev '^Got|^(\s)*$'|awk -F, 'gsub (/manager: CN=/,"",$1) {print $1}'); 
+					 net ads search "(&(objectclass=$object_to_get)(cn=$manager))" cn mail telephonenumber facsimileTelephoneNumber mobile department -e -w "$domain" -S "$host" -U "$net_user%$net_pass" 2>/dev/null | grep -Ev '^Got|^(\s)*$'
+            ;;
+
+            company)
+                object_name=$5;
+                if [ $object_to_get != "user" ]; then
+                    echo "'company' Attribute can only be queried for objects of type user."; exit 1;
+                fi
+                net ads search "(&(objectclass=$object_to_get)(samaccountname=$object_name))" company -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|grep -Ev ^Got
+            ;;
+
+            description)
+                object_name=$5;
+                if [ $object_to_get == "computer" ]; then
+                    object_name=$object_name"$";
+                fi
+                net ads search "(&(objectclass=$object_to_get)(samaccountname=$object_name))" description -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|grep -Ev ^Got
+            ;;
+
+				# Dumps os info of computers in AD
+            operatingsystem|os)
+                object_name=$5;
+                if [ $object_to_get == "computer" ]; then
+                    object_name=$object_name"$";
+                fi
+                net ads search "(&(objectclass=$object_to_get))" samaccountname operatingsystem -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|grep -Ev '^Got'|sed -re 's/operatingSystem: |sAMAccountName: |\$//g'|awk 'BEGIN {RS=""; FS="\n"; OFS="|"; ORS="\n"}; { $1=$1; if (NF == 2 && $1!~/^0$/) {print $1,$2}}'
+            ;;
+
+				# Checks if DelegateListLink is set
+            automap)
+                object_name="$5";
+                net ads search "(&(objectclass=$object_to_get))" samaccountname msExchDelegateListLink -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|grep -Ev '^Got'| grep -B1 msExchDelegateListLink: | sed -r ':a;N;$!ba;s/\n|\-\-|msExchDelegateListLink: / /g'|sed 's/sAMAccountName:/\n/g'|sed -re 's/ CN=/| CN=/g'|column -s\| -tn
+            ;;
+
+				# What year was object created
+            yearcreated)
+                begin_time=$5"0101000000.0Z";
+                end_time=$5"1231235959.0Z";
+                net ads search "(&(objectCategory=$object_to_get)(whencreated>=$begin_time)(whenCreated<=$end_time))" samaccountname -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|grep -Ev ^Got|awk -F: '{print $2}'|sed '/^$/d'|sort
+            ;;
+
+				# When was the last login
+            lastlogin)
+                object_name=${5};
+                if [ $object_to_get == "computer" ]; then
+                    object_name=${object_name}'$';
+                fi
+                D=$(net ads search "(&(objectCategory=${object_to_get})(SAMAccountname=${object_name}))" lastLogonTimestamp -e -w "$domain" -S "${host}" -U "$net_user%$net_pass"|awk -F: '/lastLogonTimestamp/ {print $2}')
+                if [ -z "$D" ]; then
+                    echo "No Logins Registered"
+                else
+                     date +%F\ %H:%M:%S --date "$(date -d "01/01/1601 UTC $(let D=D/10000000; echo $D) seconds")"
+               fi
+            ;;
+
+				# When was password last set
+            pwdlastset)
+                if [ $object_to_get != "user" ]; then
+                    echo "This function is only applicable for objects of type \"user\"."; exit 1;
+                fi
+                object_name=$5
+                D=$(net ads search "(&(objectCategory=$object_to_get)(samaccountname=$object_name))" pwdLastSet -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|awk '/pwdLast/ {print $2}';)
+                if [ $D -eq 0 ]; then
+                    echo "Password has never been changed!"
+                else
+                    date +%F\ %H:%M:%S --date "$(date -d "01/01/1601 UTC $(let D=D/10000000; echo $D) seconds")"
+                fi
+            ;;
+
+				# When was last failed loin attempt
+            badPasswordTime)
+                if [ $object_to_get != "user" ]; then
+                    echo "This function is only applicable for objects of type \"user\"."; exit 1;
+                fi
+                object_name=$5
+                D=$(net ads search "(&(objectCategory=$object_to_get)(samaccountname=$object_name))" badPasswordTime -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|awk '/badPasswordTime/ {print $2}';)
+                if [ $D -eq 0 ]; then
+                    echo "$object_name: $D"
+                else
+                    echo -n "$object_name: ";  date +%F\ %H:%M:%S --date "$(date -d "01/01/1601 UTC $(let D=D/10000000; echo $D) seconds")"
+                fi
+            ;;
+
+				# Obtain SAM from CommonName
+            getsam)
+                object_name=$5
+                net ads search "(&(objectCategory=$object_to_get)(cn=$object_name))" sAMAccountName mail cn -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|grep -v Got|awk -F: '{print $NF}'|awk 'BEGIN {RS=""; FS="\n"; OFS=","; ORS="\n"}; {$1=$1; print}'
+            ;;
+
+				# Get User Account Control settings
+            uac)
+                object_name=$5
+                net ads search "(&(objectCategory=$object_to_get)(samaccountname=$object_name))" userAccountControl -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|awk '/userAccountControl/ {print $2}';
+            ;;
+
+				# Get count of successful logins //appears to be 16-bit 
+            logoncount)
+                object_name=$5
+                net ads search "(&(objectCategory=$object_to_get)(samaccountname=$object_name))" logonCount -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|awk '/logonCount/  {print $2}; ';
+            ;;
+
+				# Get count of failed logins for a single account
+            badpwd)
+                object_name=$5
+                net ads search "(&(objectCategory=$object_to_get)(samaccountname=$object_name))" badPwdCount sAMAccountName -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|awk '/badPwdCount|sAMAccountName/ {print $1,$2}'|sed ':a;N;$!ba;s/\n/ /g'|awk '{print $NF": "$2}';
+            ;;
+
+				# Grab count of all failed auth attempts known to AD; makes a base for a good SIEM check
+            badpwd_all)
+                net ads search "(&(objectCategory=$object_to_get))" badPwdCount sAMAccountName -e -w "$domain" -S "$host" -U $net_user%$net_pass|sed -re 's/(badPwdCount|sAMAccountName): //' |awk 'BEGIN {RS=""; FS="\n"; OFS="|"; ORS="\n"}; { $1=$1; if (NF == 2 && $1!~/^0$/) {print $2,$1}}'|sort -t'|' -k2,2nr -k1,1g;
+            ;;
+            
+				# Get SamAccountName from SID
+            sidtouser|objectsid)
+                object_name=$5
+                net ads search "(&(objectCategory=$object_to_get)(objectSid=$object_name))" samaccountname  cn -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|sed ':a;N;$!ba;s/\n/ /g';
+            ;;
+
+		  # Dump an email list
+        emaillist)
+				#Depending on how AD is setup Domain may not map to SMTP domain. YMMV
+				(printf "alias/sAMAccountName|Common Name/Display|Primary SMTP Address\n"; net ads search "(objectcategory=$object_to_get)" samaccountname cn mail -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|sed 's/^$/--/g'| awk -F: '{gsub(/^(cn|sAMAccountName|mail)/,"",$1); printf "%s%%",$0;}'|sed 's/--/\n/g'|awk -F\% '{print $3"|"$2"|<"$4">"}'|sed 's/<  /</g'|egrep "\@${domain}"|sort)
+            ;;
+
+		  # Search for accounts w/o email addresses
+        noemail)
+            net ads search "(objectcategory=$object_to_get)" samaccountname cn mail -e -w "$domain" -S "$host" -U $net_user%$net_pass|sed 's/^$/--/g'| awk -F: '{gsub(/^(cn|sAMAccountName|mail)/,"",$1); printf "%s%%",$0;}'|sed 's/--/\n/g'|awk -F\% '{print $3" | "$2" | "$4}'|sed 's/<  /</g' |egrep -vi '\@'|sort -k2,2
+            ;;
+
+				#Useful for obtaining all objects of a time then feeding them back into spot_check in a for loop get or for grepping for a certain thing
+            all)
+                net ads search "(objectCategory=$object_to_get)" SAMAccountName -e -w "$domain" -S "$host" -U "$net_user%$net_pass"|grep -Ev ^Got|awk -F: '{print $2}'|sed '/^$/d'|sort
+            ;;
+            h|help|*)
+                clear;
+                echo "AD|LDAP help!"
+                echo "Object types to look for:"
+                echo "    computer";
+                echo "    group";
+                echo "    user";
+                echo "";
+                echo "    Object states to query for:";
+                echo "        disabled    //get objects of specified type that are disable";
+                echo "        enabled     //get objects of specififed type that are enable";
+                echo "        noexpire    //get object's of specified type whose password doesn't expire";
+                echo "        member      //get members of specified grou";
+                echo "        memberof    //grab groups that specified user is directly a member of";
+                echo "        whencreated //when was object created"; 
+                echo "        getinfo     //dump LDAP info about specified object";
+                echo "        alladgrpmbms //list ad groups and their members in a pipe '|' deliniated format";
+                echo "        yearcreated //get all objects of specified type created between Jan 01 00:00 Dec 31 59:59:59";
+                echo "        pwdlastset  //get the last time a user's password has been modified (applies to user accounts ONLY).";
+                echo "        badPasswordTime  //get the last time a user had entered a bad password (applies to user accounts ONLY).";
+                echo "        all         //grab all objects of specified typ";
+            ;;
+        esac #end of case/switch for $4
+;; #end of AD / LDAP
+
+   h|help|*)
+       clear;
+       echo "
+    What type of search to perform (1st argument)
+        running | running_ws | running_other //list running processes '_ws' is for workstations (use different community string)
+        installed | installed_ws //list installed applications '_ws' is for workstations (use different community string) 
+        storage |storage_ws //list available storage devices '_ws' is for workstations (use different community string)
+        shares //list SMB/CIFS shares and NFS exports (if available)
+        groups //list all local groups
+        members {host} groupname //list members of specified group e.g members fwessling-ws Administrators
+        agrpmbms //list all groups and all members of said groups
+        adminmbms_parse //list all users in specified \"admin\" groups in a grepable format
+        ad | ldap thing_to_get (must be run against AD / LDAP server)
+
+    Host to query (2nd argument)
+
+
+How to Use: `basename $0` \$thing \$host;
+
+Provided you have a server named \"phalanx\" and you want to see what's running on it (via SNMP)
+Example: 
+    \"spot_check running phalanx\" 
+    ";
+       exit 1;
+esac

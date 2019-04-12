@@ -1,0 +1,19 @@
+net_user="putusernamehere";
+net_pass="putpasswordhere";
+domain="contoso.tld"
+cifscreds_file="/path/to/cifscred/file";
+
+# These are used if you're wanting to query hosts via SNMP
+# Windows native snmp service only support SNMPv2 :(, move to WinRM/SSH/summat
+# If you're using snmp, I hope at least they're broken up by area/function
+# Here provide basic breakdown between servers, workstations, and other
+
+if [[ $thing =~ ^(running|installed|storage)$ ]]; then 
+    comm_string="Win-Server-Snmpv2String"; 
+elif [[ $thing =~ ^(running_ws|installed_ws|storage_ws)$ ]]; then
+    comm_string="Win-wks-Snmpv2String"; 
+elif [[ $thing =~ ^(running_other|installed_other|storage_other)$ ]]; then
+    comm_string="Win-Other-Snmpv2String"; 
+else
+    echo -n "";
+fi
